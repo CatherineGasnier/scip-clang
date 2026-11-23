@@ -253,6 +253,9 @@ void SnapshotPrinter::printDocument(const scip::Document &document,
                          ? "(read+write) "
                          : "(write) ";
       }
+      if (occ.symbol_roles() & scip::SymbolRole::Test) {
+        symbolRole += "(test) ";
+      }
 
       ENFORCE(range.start.column < range.end.column
                   || (range.start.line == 1 && range.end.line == 1

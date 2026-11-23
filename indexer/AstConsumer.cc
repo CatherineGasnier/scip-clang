@@ -72,6 +72,14 @@ public:
     return true;
   }
 
+  /// Called for every declaration, in addition to the more specific
+  /// Visit* methods above. See NOTE(ref: test-code).
+  bool VisitDecl(clang::Decl *decl) {
+    ENFORCE(decl, "expected visitor to only access non-null decls");
+    this->tuIndexer.trySaveTestCodeRange(*decl);
+    return true;
+  }
+
 #define TRY_TO(CALL_EXPR)              \
   do {                                 \
     if (!this->getDerived().CALL_EXPR) \
@@ -139,7 +147,8 @@ public:
       // Or should we add an other_languages in SCIP?
       document.set_language(scip::Language_Name(scip::Language::CPP));
       macroIndex.emitDocumentOccurrencesAndSymbols(
-          this->deterministic, symbolFormatter, fileId, document);
+          this->deterministic, symbolFormatter,
+          this->tuIndexer.getTestCodeRanges(), fileId, document);
       this->tuIndexer.emitDocumentOccurrencesAndSymbols(this->deterministic,
                                                         fileId, document);
       *tuIndexingOutput.docsAndExternals.add_documents() = std::move(document);

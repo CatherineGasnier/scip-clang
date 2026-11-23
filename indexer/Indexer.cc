@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/function_ref.h"
@@ -76,6 +77,24 @@ FileLocalSourceRange::makeEmpty(const clang::SourceManager &sourceManager,
 std::string FileLocalSourceRange::debugToString() const {
   return fmt::format("{}:{}-{}:{}", this->startLine, this->startColumn,
                      this->endLine, this->endColumn);
+}
+
+void TestCodeRanges::insert(clang::FileID fileId, FileLocalSourceRange range) {
+  this->map[{fileId}].push_back(range);
+}
+
+bool TestCodeRanges::contains(clang::FileID fileId, uint32_t line,
+                              uint32_t column) const {
+  auto it = this->map.find({fileId});
+  if (it == this->map.end()) {
+    return false;
+  }
+  auto position = std::make_pair(line, column);
+  // A linear scan is fine, as there are only a few ranges per test.
+  return absl::c_any_of(it->second, [&](const FileLocalSourceRange &range) {
+    return std::make_pair(range.startLine, range.startColumn) <= position
+           && position <= std::make_pair(range.endLine, range.endColumn);
+  });
 }
 
 FileLocalMacroOccurrence::FileLocalMacroOccurrence(
@@ -224,7 +243,8 @@ void MacroIndexer::saveInclude(clang::FileID containingFileId,
 }
 
 void MacroIndexer::emitDocumentOccurrencesAndSymbols(
-    bool deterministic, SymbolFormatter &symbolFormatter, clang::FileID fileId,
+    bool deterministic, SymbolFormatter &symbolFormatter,
+    const TestCodeRanges &testCodeRanges, clang::FileID fileId,
     scip::Document &document) {
   TRACE_EVENT(tracing::indexing,
               "MacroIndexer::emitDocumentOccurrencesAndSymbols");
@@ -239,6 +259,7 @@ void MacroIndexer::emitDocumentOccurrencesAndSymbols(
           [&](auto &&macroOcc) {
             scip::Occurrence occ;
             macroOcc.emitOccurrence(symbolFormatter, occ);
+            testCodeRanges.markIfInTestCode(fileId, occ);
             switch (macroOcc.role) {
             case Role::Definition: {
               scip::SymbolInformation symbolInfo{};
@@ -354,13 +375,16 @@ bool RefersToForwardDecl::check(const clang::Decl &decl) {
 
 void ForwardDeclMap::insert(SymbolNameRef symbol, DocComment &&docComment,
                             RootRelativePathRef projectFilePath,
+                            clang::FileID fileId,
                             FileLocalSourceRange occRange) {
   auto &entry = this->map[symbol]; // deliberate default initialization
   entry.docComment.replaceIfEmpty(std::move(docComment));
-  entry.ranges.push_back({projectFilePath, occRange});
+  entry.references.push_back({projectFilePath, fileId, occRange});
 }
 
-void ForwardDeclMap::emit(bool deterministic, scip::ForwardDeclIndex &index) {
+void ForwardDeclMap::emit(bool deterministic,
+                          const TestCodeRanges &testCodeRanges,
+                          scip::ForwardDeclIndex &index) {
   TRACE_EVENT(tracing::indexing, "ForwardDeclMap::emit", "size",
               this->map.size());
   scip_clang::extractTransform(
@@ -373,11 +397,12 @@ void ForwardDeclMap::emit(bool deterministic, scip::ForwardDeclIndex &index) {
                 symbol.value);
         fwdDecl.set_suffix(optSuffix->value.data(), optSuffix->value.size());
         value.docComment.addTo(*fwdDecl.mutable_documentation());
-        for (auto [path, range] : value.ranges) {
+        for (auto [path, fileId, range] : value.references) {
           scip::ForwardDecl::Reference ref{};
           range.addTo(ref);
           auto p = path.asStringView();
           ref.set_relative_path(p.data(), p.size());
+          testCodeRanges.markIfInTestCode(fileId, ref);
           *fwdDecl.add_references() = std::move(ref);
         }
         *index.add_forward_decls() = std::move(fwdDecl);
@@ -394,7 +419,32 @@ TuIndexer::TuIndexer(const clang::SourceManager &sourceManager,
       astContext(astContext), fileIdsToBeIndexed(fileIdsToBeIndexed),
       symbolFormatter(symbolFormatter), approximateNameResolver(astContext),
       documentMap(), fileMetadataMap(fileMetadataMap), externalSymbols(),
-      forwardDeclarations() {}
+      forwardDeclarations(), testCodeDetector(), testCodeRanges() {}
+
+void TuIndexer::trySaveTestCodeRange(const clang::Decl &decl) {
+  if (!this->testCodeDetector.isTestCodeRoot(decl)) {
+    return;
+  }
+  auto expansionRange =
+      this->sourceManager.getExpansionRange(decl.getSourceRange());
+  auto start = expansionRange.getBegin();
+  auto end = expansionRange.getEnd();
+  if (start.isInvalid() || end.isInvalid() || end < start) {
+    return;
+  }
+  // fromNonEmpty requires both ends to be in the same file.
+  auto fileId = this->sourceManager.getFileID(start);
+  if (this->sourceManager.getFileID(end) != fileId) {
+    return;
+  }
+  auto [range, _] =
+      FileLocalSourceRange::fromNonEmpty(this->sourceManager, {start, end});
+  this->testCodeRanges.insert(fileId, range);
+}
+
+const TestCodeRanges &TuIndexer::getTestCodeRanges() const {
+  return this->testCodeRanges;
+}
 
 void TuIndexer::saveSyntheticFileDefinition(clang::FileID fileId,
                                             const FileMetadata &fileMetadata) {
@@ -1095,6 +1145,7 @@ void TuIndexer::emitDocumentOccurrencesAndSymbols(
               "occurrences.size", doc.occurrences.size(), "symbolInfos.size",
               doc.symbolInfos.size());
   for (auto &occExt : doc.occurrences) {
+    this->testCodeRanges.markIfInTestCode(fileId, occExt.occ);
     *scipDocument.add_occurrences() = std::move(occExt.occ);
   }
   extractTransform(
@@ -1121,7 +1172,8 @@ void TuIndexer::emitExternalSymbols(bool deterministic,
 
 void TuIndexer::emitForwardDeclarations(
     bool deterministic, scip::ForwardDeclIndex &forwardDeclIndex) {
-  this->forwardDeclarations.emit(deterministic, forwardDeclIndex);
+  this->forwardDeclarations.emit(deterministic, this->testCodeRanges,
+                                 forwardDeclIndex);
 }
 
 std::pair<FileLocalSourceRange, clang::FileID>
@@ -1148,7 +1200,7 @@ void TuIndexer::saveForwardDeclaration(SymbolNameRef symbol,
     return;
   }
   this->forwardDeclarations.insert(symbol, std::move(docComment),
-                                   optStableFileId->path, range);
+                                   optStableFileId->path, fileId, range);
 }
 
 void TuIndexer::saveReference(SymbolNameRef symbol, clang::SourceLocation loc,
@@ -1168,7 +1220,7 @@ void TuIndexer::saveReference(SymbolNameRef symbol, clang::SourceLocation loc,
   if (maybeFwdDecl && RefersToForwardDecl::check(*maybeFwdDecl)) {
     auto [range, _] = this->getTokenExpansionRange(expansionLoc);
     this->forwardDeclarations.insert(symbol, this->getDocComment(*maybeFwdDecl),
-                                     optStableFileId->path, range);
+                                     optStableFileId->path, fileId, range);
     return;
   }
   (void)this->saveOccurrence(symbol, expansionLoc, extraRoles);
