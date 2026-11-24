@@ -34,6 +34,7 @@ Here are some code navigation examples:
   - [Initial scip-clang testing](#initial-scip-clang-testing)
   - [Running scip-clang on a single repo](#running-scip-clang-on-the-entire-codebase)
   - [Setting up cross-repo code navigation](#setting-up-cross-repo-code-navigation)
+  - [Test code](#test-code)
 - [Troubleshooting](#troubleshooting)
 - [Reporting issues](#reporting-issues)
 - [Documentation](#documentation)
@@ -235,6 +236,15 @@ for each translation unit in which the header is included.
 ### Setting up cross-repo code navigation
 
 See the [cross-repository setup docs](/docs/CrossRepo.md).
+
+### Test code
+
+scip-clang sets the `Test` symbol role
+([`SymbolRole.Test`](https://github.com/scip-code/scip/blob/main/scip.proto))
+on occurrences located in [GoogleTest](https://github.com/google/googletest) tests.
+This covers the code of every class deriving from `::testing::Test`,
+which includes the bodies of `TEST`, `TEST_F`, `TEST_P` and `TYPED_TEST`,
+as well as test fixtures.
 
 ## Troubleshooting
 

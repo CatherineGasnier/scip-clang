@@ -14,5 +14,7 @@ message ForwardDecl {
   message Reference {
     repeated int32 range = 1;
     string relative_path = 2;
+    // Bitset of scip.SymbolRole values for the occurrence.
+    int32 symbol_roles = 3;
   }
 }

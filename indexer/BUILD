@@ -34,6 +34,7 @@ cc_library(
         # build time.
         "@llvm-project//clang:sema",
         "@llvm-project//clang:ast",
+        "@llvm-project//clang:ast_matchers",
         "@llvm-project//clang:frontend",
         "@llvm-project//clang:tooling",
         "@scip",

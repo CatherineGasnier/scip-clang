@@ -24,6 +24,7 @@
 #include "indexer/Path.h"
 #include "indexer/ScipExtras.h"
 #include "indexer/SymbolName.h"
+#include "indexer/TestCodeDetector.h"
 
 namespace clang {
 #define FORWARD_DECLARE(ExprName) class ExprName##Expr;
@@ -102,6 +103,36 @@ struct FileLocalSourceRange {
 enum class Role {
   Definition,
   Reference,
+};
+
+/// Source ranges of test code, grouped by file. See NOTE(ref: test-code).
+class TestCodeRanges final {
+  absl::flat_hash_map<llvm_ext::AbslHashAdapter<clang::FileID>,
+                      std::vector<FileLocalSourceRange>>
+      map;
+
+public:
+  TestCodeRanges() = default;
+
+  void insert(clang::FileID, FileLocalSourceRange);
+
+  /// Adds \c scip::SymbolRole::Test to the roles of \p occ, if \p occ starts
+  /// inside test code in \p fileId.
+  ///
+  /// \p occ is a \c scip::Occurrence or a \c scip::ForwardDecl::Reference.
+  template <typename MessageT>
+  void markIfInTestCode(clang::FileID fileId, MessageT &occ) const {
+    // SCIP ranges are 0-based, unlike FileLocalSourceRange.
+    if (this->contains(fileId, uint32_t(occ.range(0)) + 1,
+                       uint32_t(occ.range(1)) + 1)) {
+      occ.set_symbol_roles(occ.symbol_roles() | scip::SymbolRole::Test);
+    }
+  }
+
+private:
+  /// Returns true if the 1-based position \p line:\p column is inside one
+  /// of the test code ranges for \p fileId.
+  bool contains(clang::FileID fileId, uint32_t line, uint32_t column) const;
 };
 
 // NOTE(def: emit-vs-save)
@@ -205,7 +236,8 @@ public:
                    AbsolutePathRef includedFilePath);
 
   void emitDocumentOccurrencesAndSymbols(bool deterministic, SymbolFormatter &,
-                                         clang::FileID, scip::Document &);
+                                         const TestCodeRanges &, clang::FileID,
+                                         scip::Document &);
   void emitExternalSymbols(bool deterministic, SymbolFormatter &,
                            scip::Index &);
 
@@ -265,12 +297,17 @@ struct RefersToForwardDecl {
 class FileMetadataMap;
 
 class ForwardDeclMap final {
+  struct Reference {
+    RootRelativePathRef projectFilePath;
+    clang::FileID fileId;
+    FileLocalSourceRange range;
+  };
   struct Value {
     DocComment docComment;
     // It is OK for this to be a vector instead of a set as the header
     // skipping optimization would prevent occurrences for the same
     // header being emitted multiple times.
-    std::vector<std::pair<RootRelativePathRef, FileLocalSourceRange>> ranges;
+    std::vector<Reference> references;
   };
   absl::flat_hash_map<SymbolNameRef, Value> map;
 
@@ -278,10 +315,11 @@ public:
   ForwardDeclMap() = default;
 
   void insert(SymbolNameRef symbol, DocComment &&,
-              RootRelativePathRef projectFilePath,
+              RootRelativePathRef projectFilePath, clang::FileID fileId,
               FileLocalSourceRange occRange);
 
-  void emit(bool deterministic, scip::ForwardDeclIndex &);
+  void emit(bool deterministic, const TestCodeRanges &,
+            scip::ForwardDeclIndex &);
 };
 
 /// Type to track which files should be indexed.
@@ -311,10 +349,19 @@ class TuIndexer final {
 
   ForwardDeclMap forwardDeclarations;
 
+  TestCodeDetector testCodeDetector;
+  TestCodeRanges testCodeRanges;
+
 public:
   TuIndexer(const clang::SourceManager &, const clang::LangOptions &,
             clang::ASTContext &, const FileIdsToBeIndexedSet &,
             SymbolFormatter &, FileMetadataMap &);
+
+  /// Records the source range of \p decl as test code, if \p decl is test
+  /// code by itself. See NOTE(ref: test-code).
+  void trySaveTestCodeRange(const clang::Decl &decl);
+
+  const TestCodeRanges &getTestCodeRanges() const;
 
   /// Emit a fake 'definition' for a file, which can be used as a target
   /// of Go to definition from #include, as well as the source for
